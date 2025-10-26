@@ -1,144 +1,252 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Dict, List, Optional
+# services/coordinator/app.py
 from collections import defaultdict
 import uuid
-import time
+from typing import Dict, List, Optional
 
-app = FastAPI(title="AI Market v0")
+from fastapi import FastAPI, HTTPException, Depends, Query
+from pydantic import BaseModel
+from sqlmodel import Session, select, func
 
-# --- In-memory stores (v0). We'll swap for Redis/SQLite later. ---
-TASKS: Dict[str, Dict] = {}
-RESULTS: Dict[str, List[Dict]] = defaultdict(list)
-LEADERBOARD: Dict[str, int] = defaultdict(int)
-PENDING: List[str] = []                  # FIFO queue of task_ids
-ASSIGNMENTS: Dict[str, List[str]] = {}   # task_id -> worker_ids assigned
-REQUIRED_SUBMISSIONS = 3                 # how many worker results before verifying
+from .db import init_db, get_session
+from .models import Task, Submission, WorkerScore
 
-# --- Schemas ---
+# -----------------------
+# FastAPI app setup
+# -----------------------
+app = FastAPI(title="AI Market v1 (SQLite)")
+
+# Initialize DB on startup
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+
+# -----------------------
+# In-memory helpers
+# -----------------------
+# Tracks which workers have been assigned to a task (lightweight helper; source of truth is DB)
+ASSIGNMENTS: Dict[str, List[str]] = {}  # task_id -> [worker_ids]
+REQUIRED_SUBMISSIONS = 3                # quorum for finalization
+
+# -----------------------
+# Request Schemas
+# -----------------------
+
+
 class CreateTask(BaseModel):
     text: str
+
 
 class WorkerRegister(BaseModel):
     worker_id: str
 
+
 class WorkerRequest(BaseModel):
     worker_id: str
+
 
 class WorkerSubmit(BaseModel):
     worker_id: str
     task_id: str
-    label: str          # "positive" or "negative"
-    confidence: float   # 0..1
+    label: str            # "positive" | "negative"
+    confidence: float     # 0..1
+
+# -----------------------
+# Health
+# -----------------------
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
+# -----------------------
+# Tasks
+# -----------------------
+
 
 @app.post("/tasks")
-def create_task(body: CreateTask):
+def create_task(body: CreateTask, session: Session = Depends(get_session)):
     task_id = str(uuid.uuid4())
-    TASKS[task_id] = {
-        "id": task_id,
-        "text": body.text,
-        "status": "queued",
-        "created_at": time.time(),
-        "final_label": None
-    }
-    PENDING.append(task_id)
+    task = Task(
+        id=task_id,
+        text=body.text,
+        status="queued",
+        required_submissions=REQUIRED_SUBMISSIONS,
+    )
+    session.add(task)
+    session.commit()
     ASSIGNMENTS[task_id] = []
     return {"task_id": task_id}
 
 
+@app.get("/tasks")
+def list_tasks(
+    status: Optional[str] = Query(
+        default=None, description="Filter by status: queued|assigned|finalized"),
+    session: Session = Depends(get_session),
+):
+    stmt = select(Task)
+    if status:
+        stmt = stmt.where(Task.status == status)
+    tasks = session.exec(stmt).all()
+    return [
+        {
+            "id": t.id,
+            "text": t.text,
+            "status": t.status,
+            "final_label": t.final_label,
+            "required_submissions": t.required_submissions,
+        }
+        for t in tasks
+    ]
+
+
 @app.get("/tasks/{task_id}")
-def get_task(task_id: str):
-    task = TASKS.get(task_id)
+def get_task(task_id: str, session: Session = Depends(get_session)):
+    task = session.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    subs = session.exec(select(Submission).where(
+        Submission.task_id == task_id)).all()
     return {
-        **task,
-        "submissions": RESULTS.get(task_id, []),
+        "id": task.id,
+        "text": task.text,
+        "status": task.status,
+        "final_label": task.final_label,
+        "required_submissions": task.required_submissions,
+        "submissions": [
+            {"worker_id": s.worker_id, "label": s.label, "confidence": s.confidence}
+            for s in subs
+        ],
     }
 
-
-@app.get("/leaderboard")
-def leaderboard():
-    # return as sorted list
-    ranked = sorted(LEADERBOARD.items(), key=lambda x: x[1], reverse=True)
-    return [{"worker_id": w, "points": p} for w, p in ranked]
+# -----------------------
+# Workers
+# -----------------------
 
 
 @app.post("/workers/register")
-def register_worker(body: WorkerRegister):
-    # v0: nothing persistent—just acknowledge
-    return {"ok": True, "worker_id": body.worker_id}
+def register_worker(_: WorkerRegister):
+    # Placeholder for future identity/auth; returns OK so workers can proceed
+    return {"ok": True}
 
 
 @app.post("/tasks/next")
-def next_task(body: WorkerRequest):
+def next_task(body: WorkerRequest, session: Session = Depends(get_session)):
     """
-    Very simple "pull the next task I don't have yet".
-    In production you'd use Redis with reservations and a TTL.
+    Returns the next available task that:
+      - is not finalized
+      - still needs submissions (< required_submissions)
+      - hasn't already been assigned to this worker (per ASSIGNMENTS helper)
     """
-    # find first pending task not yet assigned to this worker
-    for task_id in list(PENDING):
-        if len(ASSIGNMENTS[task_id]) >= REQUIRED_SUBMISSIONS:
+    tasks = session.exec(select(Task).where(Task.status != "finalized")).all()
+    for t in tasks:
+        assigned = ASSIGNMENTS.setdefault(t.id, [])
+        # how many submissions already exist for this task?
+        subs_count = len(session.exec(
+            select(Submission).where(Submission.task_id == t.id)).all())
+        if subs_count >= t.required_submissions:
             continue
-        if body.worker_id not in ASSIGNMENTS[task_id]:
-            ASSIGNMENTS[task_id].append(body.worker_id)
-            task = TASKS[task_id]
-            task["status"] = "assigned"
-            return {"task_id": task_id, "text": task["text"]}
+        if body.worker_id in assigned:
+            continue
+
+        # assign to this worker
+        assigned.append(body.worker_id)
+
+        if t.status == "queued":
+            t.status = "assigned"
+            session.add(t)
+            session.commit()
+
+        return {"task_id": t.id, "text": t.text}
+
     return {"task_id": None, "text": None}  # no work right now
 
 
 @app.post("/workers/submit")
-def submit_result(body: WorkerSubmit):
-    task = TASKS.get(body.task_id)
+def submit_result(body: WorkerSubmit, session: Session = Depends(get_session)):
+    task = session.get(Task, body.task_id)
     if not task:
         raise HTTPException(404, "Task not found")
 
-    # store submission (dedupe simple)
-    already = [r for r in RESULTS[body.task_id] if r["worker_id"] == body.worker_id]
-    if not already:
-        RESULTS[body.task_id].append({
-            "worker_id": body.worker_id,
-            "label": body.label,
-            "confidence": body.confidence
-        })
+    # Deduplicate: only one submission per (worker, task)
+    existing = session.exec(
+        select(Submission).where(
+            (Submission.task_id == body.task_id) & (
+                Submission.worker_id == body.worker_id)
+        )
+    ).first()
+    if not existing:
+        session.add(
+            Submission(
+                task_id=body.task_id,
+                worker_id=body.worker_id,
+                label=body.label,
+                confidence=body.confidence,
+            )
+        )
+        session.commit()
 
-    # if we have enough submissions, verify (majority vote)
-    if len(RESULTS[body.task_id]) >= REQUIRED_SUBMISSIONS and task["final_label"] is None:
-        counts = defaultdict(int)
-        for r in RESULTS[body.task_id]:
-            counts[r["label"]] += 1
-        # majority (break ties by highest average confidence for a label)
+    # Check if we can finalize
+    subs = session.exec(select(Submission).where(
+        Submission.task_id == body.task_id)).all()
+    if task.final_label is None and len(subs) >= task.required_submissions:
+        # Majority vote
+        counts: Dict[str, int] = defaultdict(int)
+        for s in subs:
+            counts[s.label] += 1
+
         max_votes = max(counts.values())
         majority_labels = [lbl for lbl, c in counts.items() if c == max_votes]
+
         if len(majority_labels) == 1:
-            final_label = majority_labels[0]
+            final = majority_labels[0]
         else:
-            # tie-breaker: avg confidence per label
-            best_label, best_conf = None, -1
+            # tie-break: highest average confidence
+            best_lbl, best_conf = None, -1.0
             for lbl in majority_labels:
-                confs = [r["confidence"] for r in RESULTS[body.task_id] if r["label"] == lbl]
-                avg = sum(confs)/len(confs)
+                confs = [s.confidence for s in subs if s.label == lbl]
+                avg = sum(confs) / len(confs)
                 if avg > best_conf:
-                    best_label, best_conf = lbl, avg
-            final_label = best_label
+                    best_lbl, best_conf = lbl, avg
+            final = best_lbl
 
-        task["final_label"] = final_label
-        task["status"] = "finalized"
+        # Persist finalization
+        task.final_label = final
+        task.status = "finalized"
+        session.add(task)
 
-        # award +1 to correct workers
-        for r in RESULTS[body.task_id]:
-            if r["label"] == final_label:
-                LEADERBOARD[r["worker_id"]] += 1
+        # Award points to matching workers
+        winners = {s.worker_id for s in subs if s.label == final}
+        for wid in winners:
+            row = session.get(WorkerScore, wid)
+            if not row:
+                row = WorkerScore(worker_id=wid, points=0)
+            row.points += 1
+            session.add(row)
 
-        # remove from queue if still pending
-        if body.task_id in PENDING:
-            PENDING.remove(body.task_id)
+        session.commit()
 
-    return {"ok": True, "finalized": task["final_label"] is not None}
+    return {"ok": True, "finalized": task.final_label is not None}
+
+# -----------------------
+# Leaderboard
+# -----------------------
+
+
+@app.get("/leaderboard")
+def leaderboard(session: Session = Depends(get_session)):
+    rows = session.exec(select(WorkerScore)).all()
+    rows.sort(key=lambda r: r.points, reverse=True)
+    return [{"worker_id": r.worker_id, "points": r.points} for r in rows]
+
+
+@app.get("/db/stats")
+def db_stats(session: Session = Depends(get_session)):
+    tasks = session.exec(select(func.count(Task.id))).one()
+    subs = session.exec(select(func.count(Submission.id))).one()
+    wrks = session.exec(select(func.count(WorkerScore.worker_id))).one()
+    return {"tasks": tasks, "submissions": subs, "workers": wrks}
