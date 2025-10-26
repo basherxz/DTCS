@@ -101,6 +101,8 @@ Expected output:
 {"worker_id": "carole", "points": 2}
 ]
 
+---
+
 ## 🧩 Tech Stack
 
 **Python 3.11+ – modern async and typing support**
@@ -117,35 +119,39 @@ Expected output:
 
 **Makefile + Devcontainer – reproducible development environment**
 
+---
+
 ## 🧠 Next Milestones
 
-### Heartbeat & Reliability
+**Heartbeat & Reliability**
 
-**Let workers send periodic “I’m alive” pings.**
+- Let workers send periodic “I’m alive” pings.
 
-**Reassign stuck tasks automatically if a worker goes offline.**
+- Reassign stuck tasks automatically if a worker goes offline.
 
-### Task Categories
+**Task Categories**
 
-**Add a task_type field (sentiment, summarization, translation …)**
+- Add a task_type field (sentiment, summarization, translation …)\*\*
 
-**Route each task to a compatible worker model.**
+- Route each task to a compatible worker model.\*\*
 
-### Redis / PostgreSQL
+**Redis / PostgreSQL**
 
-**Swap the in-memory queue and SQLite for Redis + Postgres to scale horizontally.**
+- Swap the in-memory queue and SQLite for Redis + Postgres to scale horizontally.\*\*
 
-### Authentication
+**Authentication**
 
-**Simple API-key or token system for registered workers.**
+- Simple API-key or token system for registered workers.\*\*
 
-### Web Dashboard
+**Web Dashboard**
 
-**A small HTML/JS frontend showing live tasks, logs, and leaderboard data.**
+- A small HTML/JS frontend showing live tasks, logs, and leaderboard data.\*\*
 
-### Model Diversity
+**Model Diversity**
 
-**Allow workers to specify different HF models and track their accuracy or specialization.**
+- Allow workers to specify different HF models and track their accuracy or specialization.\*\*
+
+---
 
 ## 🧪 API Reference
 
@@ -159,6 +165,8 @@ Expected output:
 | `POST` | `/workers/submit`  | Worker submits result for a task                      |
 | `GET`  | `/leaderboard`     | Get all worker scores                                 |
 | `GET`  | `/db/stats`        | Debug endpoint: number of tasks, submissions, workers |
+
+---
 
 ## 🧱 Directory Overview
 
@@ -179,6 +187,8 @@ ai-market/
 ├── coordinator.db          # SQLite database (auto-generated)
 └── README.md
 ```
+
+---
 
 ## 📈 Example Workflow
 
@@ -208,7 +218,10 @@ curl -X POST http://localhost:8000/tasks \
 curl http://localhost:8000/leaderboard | jq
 ```
 
-📄 License
+---
 
-MIT License © 2025 [Built by Sint/Basherxz]
-Vì một tương lai không phải thiếu nợ.
+## 📄 License
+
+**MIT License © 2025 [Built by Sint/Basherxz]**
+
+- Vì một tương lai không phải thiếu nợ.
