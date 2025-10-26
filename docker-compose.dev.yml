@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .devcontainer
+      dockerfile: Dockerfile
+    image: ai-market-dev:latest
+    container_name: ai-market-app
+    volumes:
+      - .:/workspaces/${LOCAL_BASENAME:-repo}
+    environment:
+      - PIP_CACHE_DIR=/home/vscode/.cache/pip
+      - REDIS_URL=redis://redis:6379/0
+      - PYTHONPATH=/workspaces/${LOCAL_BASENAME:-repo}
+      - LOCAL_BASENAME=ai-market
+    command: sleep infinity
+    networks: [devnet]
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-market-redis
+    ports:
+      - "6379:6379"
+    networks: [devnet]
+
+networks:
+  devnet:
+    driver: bridge

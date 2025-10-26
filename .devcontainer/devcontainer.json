@@ -1,0 +1,43 @@
+{
+  "name": "ai-market-dev",
+  "dockerComposeFile": ["../docker-compose.dev.yml"],
+  "service": "app",
+  "workspaceFolder": "/workspaces/repo",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "username": "vscode",
+      "installZsh": false,
+      "upgradePackages": true
+    },
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    },
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "containerUser": "vscode",
+  "postCreateCommand": "python -m pip install -U pip && python -m pip install -r .devcontainer/requirements.txt",
+  "forwardPorts": [8000, 6379],
+  "remoteEnv": {
+    "HF_HOME": "/workspaces/repo/.hf-cache",
+    "PYTHONUNBUFFERED": "1",
+    "UVICORN_RELOAD": "true"
+  },
+  "mounts": [
+    "source=python_cache,target=/home/vscode/.cache/pip,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "editor.formatOnSave": true
+      },
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-azuretools.vscode-docker",
+        "mhutchie.git-graph",
+        "esbenp.prettier-vscode"
+      ]
+    }
+  }
+}

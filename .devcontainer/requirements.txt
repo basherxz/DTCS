@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+sqlalchemy
+pydantic
+redis
+httpx
+transformers==4.57.1
+huggingface-hub
+torch --index-url https://download.pytorch.org/whl/cpu
+python-dotenv
