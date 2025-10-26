@@ -23,36 +23,16 @@ Built with **FastAPI**, **SQLModel**, and **Hugging Face Transformers** — insp
 
 ---
 
-## 🗂 Project Structure
+## ⚙️ Setup
 
-ai-market/
-│
-├── services/
-│ ├── coordinator/
-│ │ ├── init.py
-│ │ ├── app.py # FastAPI app (task + worker endpoints)
-│ │ ├── db.py # Database engine + session manager
-│ │ └── models.py # SQLModel ORM classes
-│ │
-│ └── worker/
-│ └── worker.py # Worker process (model inference loop)
-│
-├── .devcontainer/ # VS Code Dev Container config
-├── Makefile # Shortcuts: make dev / make worker
-├── requirements.txt # Python dependencies
-├── coordinator.db # SQLite database (auto-created)
-└── README.md
-
-⚙️ Setup
-
-1. Clone the repo
+### 1. Clone the repo
 
 ```bash
 git clone https://github.com/basherxz/ai-market.git
 cd ai-market
 ```
 
-2. Install dependencies
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -60,7 +40,7 @@ pip install -r requirements.txt
 
 If you’re using VS Code Dev Container, dependencies will install automatically when the container builds.
 
-3. Start the coordinator (FastAPI server)
+### 3. Start the coordinator (FastAPI server)
 
 ```bash
 make dev
@@ -79,7 +59,7 @@ Leaderboard scoring
 It runs on http://localhost:8000
 .
 
-4. Start workers (in separate terminals)
+### 4. Start workers (in separate terminals)
 
 Each worker connects to the coordinator and performs inference tasks using Hugging Face Transformers.
 
@@ -89,7 +69,7 @@ make worker WORKER_ID=bob
 make worker WORKER_ID=carole
 ```
 
-5. Verify setup
+### 5. Verify setup
 
 ```bash
 curl -s http://localhost:8000/health | jq
@@ -99,7 +79,7 @@ Expected output:
 
 {"ok": true}
 
-6. Submit a test task
+### 6. Submit a test task
 
 ```bash
 curl -s -X POST http://localhost:8000/tasks \
@@ -107,7 +87,7 @@ curl -s -X POST http://localhost:8000/tasks \
   -d '{"text":"I absolutely love how this works!"}'
 ```
 
-7. View leaderboard
+### 7. View leaderboard
 
 ```bash
 curl -s http://localhost:8000/leaderboard | jq
