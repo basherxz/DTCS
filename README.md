@@ -23,6 +23,31 @@ Built with **FastAPI**, **SQLModel**, and **Hugging Face Transformers** — insp
 
 ---
 
+## 🧱 Directory Overview
+
+```
+.devcontainer/
+  ├─ Dockerfile
+  ├─ devcontainer.json
+  └─ requirements.txt
+services/
+  ├─ coordinator/
+  │  ├─ __init__.py
+  │  ├─ app.py          # FastAPI app + endpoints
+  │  ├─ db.py           # SQLModel engine + session + init
+  │  └─ models.py       # Task, Submission, WorkerScore
+  └─ worker/
+     └─ worker.py       # (stateless loop; not shown here)
+.gitignore
+Makefile
+README.md
+coordinator.db
+db_check.py
+docker-compose.dev.yml
+```
+
+---
+
 ## ⚙️ Setup
 
 ### 1. Clone the repo
@@ -121,9 +146,107 @@ Expected output:
 
 ---
 
+## Heartbeats & Reliability
+
+This release introduces a real lease system, worker heartbeats, and automatic task recovery.
+It’s still fully backward-compatible with previous phases.
+
+### New concepts
+
+| Feature             | Purpose                                                                                    | Key fields / endpoints                                                            |
+| ------------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
+| **Leases**          | Prevent two workers from claiming the same task simultaneously.                            | `Task.lease_expires_at`, `Task.reserved_by`, `Task.attempts`, `Task.max_attempts` |
+| **Heartbeats**      | Let the coordinator know a worker is alive and optionally renew leases for tasks it holds. | `POST /workers/heartbeat`                                                         |
+| **Auto-requeue**    | Reclaim tasks whose lease expired or whose worker went stale.                              | background sweeper + `POST /ops/requeue-stale`                                    |
+| **Worker registry** | Track status (`active / stale / offline`) and capabilities.                                | `Worker` table, `POST /workers/register`                                          |
+
+### Quick start
+
+- 1. Start coordinator
+
+```bash
+uvicorn services.coordinator.app:app --reload --port 8000
+```
+
+- 2. Register workers
+
+```bash
+curl -sX POST localhost:8000/workers/register  -H 'Content-Type: application/json' -d '{"worker_id":"w1"}'
+curl -sX POST localhost:8000/workers/heartbeat -H 'Content-Type: application/json' -d '{"worker_id":"w1"}'
+```
+
+- 3. Enqueue a task
+
+```bash
+curl -sX POST localhost:8000/tasks -H 'Content-Type: application/json' -d '{"text":"Reliability test headline"}'
+```
+
+- 4. Claim & inspect
+
+```bash
+curl -sX POST localhost:8000/tasks/next -H 'Content-Type: application/json' -d '{"worker_id":"w1"}'
+curl -s localhost:8000/tasks | jq 'map({id,status,reserved_by,lease_expires_at,attempts})'
+```
+
+- 5. Submit a result
+
+```bash
+curl -sX POST localhost:8000/workers/submit -H 'Content-Type: application/json' \
+     -d '{"worker_id":"w1","task_id":"<uuid>","label":"positive","confidence":0.9}'
+```
+
+### Configurable tunables
+
+| Variable                | Default | Description                                                              |
+| ----------------------- | ------- | ------------------------------------------------------------------------ |
+| `HEARTBEAT_TTL_SECONDS` | 45      | Worker marked stale if no heartbeat within this window.                  |
+| `LEASE_SECONDS`         | 75      | How long a claimed task stays reserved before it’s eligible for requeue. |
+| `REQUEUE_SWEEP_SECONDS` | 15      | How often the background thread checks for expired leases.               |
+| `MAX_ATTEMPTS_DEFAULT`  | 5       | Maximum claim attempts before a task becomes `failed`.                   |
+
+Override by editing services/coordinator/app.py or exporting environment variables before launch.
+
+### Maintenance & testing endpoints
+
+| Endpoint                  | Purpose                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------ |
+| `POST /ops/requeue-stale` | Manually force a requeue sweep.                                                |
+| `POST /ops/reset`         | _(dev only)_ Clear all tables (`task`, `submission`, `worker`, `workerscore`). |
+| `GET /db/stats`           | Summary counts for tasks, submissions, and workers.                            |
+| `GET /leaderboard`        | Worker scores and ranking.                                                     |
+
+### Typical lifecycle
+
+Worker registers + heartbeats
+→ appears in /db/stats and remains active.
+
+Worker claims a task via '/tasks/next'.
+→ coordinator marks task assigned and sets lease_expires_at.
+
+Worker sends heartbeats while working.
+→ each heartbeat renews the lease.
+
+Worker submits results.
+→ task finalizes after reaching required_submissions.
+
+If the worker crashes or stops heartbeating,
+→ the sweeper requeues the task when the lease expires.
+
+### Development helpers
+
+| Command                                  | Description                          |
+| ---------------------------------------- | ------------------------------------ |
+| `curl -s localhost:8000/health`          | simple health check                  |
+| `curl -s localhost:8000/tasks`           | list all tasks                       |
+| `curl -s localhost:8000/tasks/<id>`      | inspect a specific task              |
+| `curl -sX POST localhost:8000/ops/reset` | wipe everything                      |
+| `sqlite3 coordinator.db '.tables'`       | inspect DB (if SQLite CLI installed) |
+
+---
+
 ## 🧠 Next Milestones
 
-**Heartbeat & Reliability**
+**Heartbeat & Reliability** (Done)
 
 - Let workers send periodic “I’m alive” pings.
 
@@ -165,28 +288,6 @@ Expected output:
 | `POST` | `/workers/submit`  | Worker submits result for a task                      |
 | `GET`  | `/leaderboard`     | Get all worker scores                                 |
 | `GET`  | `/db/stats`        | Debug endpoint: number of tasks, submissions, workers |
-
----
-
-## 🧱 Directory Overview
-
-```
-ai-market/
-├── services/
-│   ├── coordinator/
-│   │   ├── app.py          # FastAPI coordinator API
-│   │   ├── db.py           # Database and session helpers
-│   │   ├── models.py       # ORM models
-│   │   └── __init__.py
-│   └── worker/
-│       └── worker.py       # ML inference worker
-│
-├── .devcontainer/          # VS Code Dev Container config
-├── Makefile                # Helper commands (make dev, make worker)
-├── requirements.txt        # Python dependencies
-├── coordinator.db          # SQLite database (auto-generated)
-└── README.md
-```
 
 ---
 
