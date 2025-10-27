@@ -43,10 +43,18 @@ def _apply_sqlite_safe_migrations() -> None:
         if "error_message" not in cols:
             conn.exec_driver_sql(
                 "ALTER TABLE task ADD COLUMN error_message TEXT")
+        if "type" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE task ADD COLUMN type TEXT")  # NEW in Phase 4
 
         # tasks.status may need to support "failed"; nothing to migrate structurally.
 
         # Workers table created by metadata.create_all
+
+
+def count_table(table: str) -> int:
+    with engine.connect() as c:
+        return c.exec_driver_sql(f"SELECT COUNT(*) FROM {table}").scalar_one()
 
 
 @contextmanager

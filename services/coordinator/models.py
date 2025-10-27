@@ -10,6 +10,10 @@ class Task(SQLModel, table=True):
     id: str = Field(primary_key=True)  # UUID string
     text: str
 
+    # NEW in Phase 4
+    # e.g., "sentiment", "ner", "crawl"
+    type: Optional[str] = Field(default=None, index=True)
+
     # Phase 2
     status: str  # "queued" | "assigned" | "finalized" | (NEW) "failed"
     final_label: Optional[str] = None

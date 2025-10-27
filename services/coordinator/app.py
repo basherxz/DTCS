@@ -4,7 +4,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from datetime import datetime, timedelta
-
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
+import time
+from functools import wraps
 from sqlmodel import select
 
 from .db import init_db, get_session, now_utc
@@ -18,6 +21,34 @@ LEASE_SECONDS = 50                # how long a task lease lasts
 REQUEUE_SWEEP_SECONDS = 10        # background sweep interval
 MAX_ATTEMPTS_DEFAULT = 5
 
+# ---------- Metrics ----------
+REQ_LATENCY = Histogram("api_request_latency_seconds",
+                        "Latency of API endpoints", ["route", "method"])
+TASK_CREATED = Counter("tasks_created_total", "Tasks created", ["type"])
+TASK_CLAIMED = Counter("tasks_claimed_total", "Tasks claimed", ["type"])
+TASK_FINALIZED = Counter("tasks_finalized_total",
+                         "Tasks finalized", ["type", "final_label"])
+TASK_FAILED = Counter("tasks_failed_total", "Tasks failed", ["type"])
+WORKER_HEARTBEAT = Counter("worker_heartbeats_total", "Heartbeats received")
+QUEUE_DEPTH = Gauge("queue_depth", "Number of tasks by status", [
+                    "status"])  # queued/assigned/finalized/failed
+WORKERS_GAUGE = Gauge("workers_active", "Number of active workers")
+
+
+def timed(route_name):
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*a, **kw):
+            start = time.time()
+            try:
+                return fn(*a, **kw)
+            finally:
+                REQ_LATENCY.labels(route=route_name, method="POST" if route_name.startswith(
+                    ("POST", "/")) else "GET").observe(time.time()-start)
+        return wrapper
+    return deco
+
+
 # ---- Phase 2 in-memory assignment aid (kept for compatibility) ----
 ASSIGNMENTS: Dict[str, List[str]] = {}  # task_id -> [worker_ids]
 
@@ -26,6 +57,7 @@ ASSIGNMENTS: Dict[str, List[str]] = {}  # task_id -> [worker_ids]
 
 class CreateTaskBody(BaseModel):
     text: str
+    type: Optional[str] = None  # NEW
     required_submissions: Optional[int] = 3
     max_attempts: Optional[int] = MAX_ATTEMPTS_DEFAULT
 
@@ -96,6 +128,7 @@ def register_worker(body: RegisterBody):
 
 
 @app.post("/workers/heartbeat")
+@timed("POST /workers/heartbeat")
 def heartbeat(body: HeartbeatBody):
     now = now_utc()
     with get_session() as s:
@@ -118,6 +151,8 @@ def heartbeat(body: HeartbeatBody):
         for t in held:
             t.lease_expires_at = lease_until
         s.commit()
+    WORKER_HEARTBEAT.inc()
+    _update_worker_gauge()
     return {"ok": True, "ts": now.isoformat()}
 
 
@@ -133,12 +168,14 @@ def _mark_stale_workers():
 
 # ---------- Tasks ----------
 @app.post("/tasks")
+@timed("POST /tasks")
 def create_task(body: CreateTaskBody):
     from uuid import uuid4
     now = now_utc()
     t = Task(
         id=str(uuid4()),
         text=body.text,
+        type=body.type,  # NEW
         status="queued",
         final_label=None,
         required_submissions=body.required_submissions or 3,
@@ -152,7 +189,9 @@ def create_task(body: CreateTaskBody):
     with get_session() as s:
         s.add(t)
         s.commit()
-        s.refresh(t)  # ensures attributes are loaded and not expired
+        s.refresh(t)
+    TASK_CREATED.labels(t.type or "generic").inc()
+    _update_queue_gauges()  # refresh gauges
     return {"task_id": t.id}
 
 
@@ -215,40 +254,62 @@ def get_task(task_id: str):
 
 
 @app.post("/tasks/next")
+@timed("POST /tasks/next")
 def next_task(body: NextTaskBody):
     now = now_utc()
     lease_until = now + timedelta(seconds=LEASE_SECONDS)
+    worker_caps = None
     with get_session() as s:
-        # Prefer queued tasks; ignore finalized/failed
-        stmt = select(Task).where(Task.status.in_(("queued", "assigned"))).order_by(
-            Task.created_at.asc(), Task.id.asc())
+        w = s.get(Worker, body.worker_id)
+        if w and w.capabilities_json:
+            try:
+                import json
+                worker_caps = set(json.loads(w.capabilities_json) or [])
+            except Exception:
+                worker_caps = None
+
+        stmt = (
+            select(Task)
+            .where(Task.status.in_(("queued", "assigned")))
+            .order_by(Task.created_at.asc(), Task.id.asc())  # FIFO
+        )
         tasks = s.exec(stmt).all()
 
-        # Filter out finalized and failed, and those that already met required_submissions
-        eligible: List[Task] = []
         for t in tasks:
             if t.status == "finalized" or t.status == "failed":
                 continue
-            # Keep if queued, or assigned but lease expired
-            if t.status == "queued":
-                eligible.append(t)
-            elif t.status == "assigned" and (t.lease_expires_at is None or t.lease_expires_at <= now):
-                eligible.append(t)
 
-        # Skip ones this worker already handled in this process memory
-        for t in eligible:
-            if ASSIGNMENTS.get(t.id) and body.worker_id in ASSIGNMENTS[t.id]:
+            # Capability filter (skip if task type not supported by worker)
+            if t.type and worker_caps is not None and t.type not in worker_caps:
                 continue
 
-            # Claim this one atomically
+            # If assigned but lease expired -> eligible
+            if t.status == "assigned" and t.lease_expires_at and t.lease_expires_at > now:
+                # still leased by someone else, skip
+                continue
+
+            # Skip only if this worker already submitted for this task (true dedup)
+            already_submitted = s.exec(
+                select(Submission).where(
+                    (Submission.task_id == t.id) & (
+                        Submission.worker_id == body.worker_id)
+                )
+            ).first()
+            if already_submitted:
+                continue
+
+            # Claim
             t.status = "assigned"
             t.reserved_by = body.worker_id
             t.lease_expires_at = lease_until
             t.attempts = (t.attempts or 0) + 1
             s.add(t)
-            # update memory helper
-            ASSIGNMENTS.setdefault(t.id, []).append(body.worker_id)
             s.commit()
+            s.refresh(t)
+
+            ASSIGNMENTS.setdefault(t.id, []).append(body.worker_id)
+            TASK_CLAIMED.labels(t.type or "generic").inc()
+            _update_queue_gauges()
             return {"task_id": t.id, "text": t.text}
 
     return {"task_id": None, "text": None}
@@ -305,6 +366,7 @@ def submit_result(body: SubmitBody):
             t.status = "finalized"
             t.reserved_by = None
             t.lease_expires_at = None
+            TASK_FINALIZED.labels((t.type or "generic"), best_label).inc()
 
             # Award points
             winners = [sub.worker_id for sub in subs if sub.label == best_label]
@@ -349,6 +411,7 @@ def _requeue_expired() -> int:
                         t.error_message or "max attempts reached")
                     t.reserved_by = None
                     t.lease_expires_at = None
+                    TASK_FAILED.labels(t.type or "generic").inc()
                 else:
                     t.status = "queued"
                     t.reserved_by = None
@@ -400,3 +463,28 @@ def reset_db():
         s.exec("DELETE FROM worker")
         s.commit()
     return {"ok": True, "msg": "All tables cleared."}
+
+
+@app.get("/metrics")
+def metrics():
+    # keep gauges fresh
+    _update_queue_gauges()
+    _update_worker_gauge()
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+def _update_queue_gauges():
+    with get_session() as s:
+        for st in ("queued", "assigned", "finalized", "failed"):
+            cnt = s.exec(select(Task).where(Task.status == st)).all()
+            QUEUE_DEPTH.labels(st).set(len(cnt))
+
+
+def _update_worker_gauge():
+    with get_session() as s:
+        workers = s.exec(select(Worker)).all()
+        # Active == last_seen within TTL
+        cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TTL_SECONDS)
+        active = sum(1 for w in workers if w.last_seen and w.last_seen >=
+                     cutoff and w.status == "active")
+        WORKERS_GAUGE.set(active)
