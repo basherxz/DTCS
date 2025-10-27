@@ -1,4 +1,4 @@
-# 🧠 AI Market – Distributed AI Task Network
+# 🧠 Distributed Task Coordination System
 
 - Không hi vọng nhiều nhưng cũng phải cố gắng hết mình trước đã
 
