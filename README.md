@@ -162,33 +162,33 @@ It’s still fully backward-compatible with previous phases.
 
 ### Quick start
 
-- 1. Start coordinator
+- Start coordinator
 
 ```bash
 uvicorn services.coordinator.app:app --reload --port 8000
 ```
 
-- 2. Register workers
+- Register workers
 
 ```bash
 curl -sX POST localhost:8000/workers/register  -H 'Content-Type: application/json' -d '{"worker_id":"w1"}'
 curl -sX POST localhost:8000/workers/heartbeat -H 'Content-Type: application/json' -d '{"worker_id":"w1"}'
 ```
 
-- 3. Enqueue a task
+- Enqueue a task
 
 ```bash
 curl -sX POST localhost:8000/tasks -H 'Content-Type: application/json' -d '{"text":"Reliability test headline"}'
 ```
 
-- 4. Claim & inspect
+- Claim & inspect
 
 ```bash
 curl -sX POST localhost:8000/tasks/next -H 'Content-Type: application/json' -d '{"worker_id":"w1"}'
 curl -s localhost:8000/tasks | jq 'map({id,status,reserved_by,lease_expires_at,attempts})'
 ```
 
-- 5. Submit a result
+- Submit a result
 
 ```bash
 curl -sX POST localhost:8000/workers/submit -H 'Content-Type: application/json' \
