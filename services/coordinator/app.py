@@ -1,252 +1,402 @@
 # services/coordinator/app.py
-from collections import defaultdict
-import uuid
-from typing import Dict, List, Optional
-
-from fastapi import FastAPI, HTTPException, Depends, Query
+from __future__ import annotations
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sqlmodel import Session, select, func
+from typing import Optional, List, Dict
+from datetime import datetime, timedelta
 
-from .db import init_db, get_session
-from .models import Task, Submission, WorkerScore
+from sqlmodel import select
 
-# -----------------------
-# FastAPI app setup
-# -----------------------
-app = FastAPI(title="AI Market v1 (SQLite)")
+from .db import init_db, get_session, now_utc
+from .models import Task, Submission, WorkerScore, Worker
 
-# Initialize DB on startup
+app = FastAPI(title="AI Market Coordinator")
 
+# ---- Tunables (env-overridable if you like) ----
+HEARTBEAT_TTL_SECONDS = 75        # mark worker stale if no heartbeat within this
+LEASE_SECONDS = 50                # how long a task lease lasts
+REQUEUE_SWEEP_SECONDS = 10        # background sweep interval
+MAX_ATTEMPTS_DEFAULT = 5
 
-@app.on_event("startup")
-def on_startup():
-    init_db()
-
-
-# -----------------------
-# In-memory helpers
-# -----------------------
-# Tracks which workers have been assigned to a task (lightweight helper; source of truth is DB)
+# ---- Phase 2 in-memory assignment aid (kept for compatibility) ----
 ASSIGNMENTS: Dict[str, List[str]] = {}  # task_id -> [worker_ids]
-REQUIRED_SUBMISSIONS = 3                # quorum for finalization
 
-# -----------------------
-# Request Schemas
-# -----------------------
+# ---------- Schemas ----------
 
 
-class CreateTask(BaseModel):
+class CreateTaskBody(BaseModel):
     text: str
+    required_submissions: Optional[int] = 3
+    max_attempts: Optional[int] = MAX_ATTEMPTS_DEFAULT
 
 
-class WorkerRegister(BaseModel):
+class NextTaskBody(BaseModel):
     worker_id: str
 
 
-class WorkerRequest(BaseModel):
-    worker_id: str
-
-
-class WorkerSubmit(BaseModel):
+class SubmitBody(BaseModel):
     worker_id: str
     task_id: str
-    label: str            # "positive" | "negative"
-    confidence: float     # 0..1
+    label: str
+    confidence: float
 
-# -----------------------
-# Health
-# -----------------------
+
+class RegisterBody(BaseModel):
+    worker_id: str
+    capabilities_json: Optional[str] = None
+
+
+class HeartbeatBody(BaseModel):
+    worker_id: str
+
+
+# ---------- Lifecycle ----------
+@app.on_event("startup")
+def _startup() -> None:
+    init_db()
+    # Start a lightweight sweep to mark stale workers and requeue expired leases
+    import threading
+    import time
+
+    def sweeper():
+        while True:
+            try:
+                _mark_stale_workers()
+                _requeue_expired()
+            except Exception:
+                # Keep daemon alive no matter what
+                pass
+            time.sleep(REQUEUE_SWEEP_SECONDS)
+    t = threading.Thread(target=sweeper, daemon=True)
+    t.start()
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-# -----------------------
-# Tasks
-# -----------------------
 
-
-@app.post("/tasks")
-def create_task(body: CreateTask, session: Session = Depends(get_session)):
-    task_id = str(uuid.uuid4())
-    task = Task(
-        id=task_id,
-        text=body.text,
-        status="queued",
-        required_submissions=REQUIRED_SUBMISSIONS,
-    )
-    session.add(task)
-    session.commit()
-    ASSIGNMENTS[task_id] = []
-    return {"task_id": task_id}
-
-
-@app.get("/tasks")
-def list_tasks(
-    status: Optional[str] = Query(
-        default=None, description="Filter by status: queued|assigned|finalized"),
-    session: Session = Depends(get_session),
-):
-    stmt = select(Task)
-    if status:
-        stmt = stmt.where(Task.status == status)
-    tasks = session.exec(stmt).all()
-    return [
-        {
-            "id": t.id,
-            "text": t.text,
-            "status": t.status,
-            "final_label": t.final_label,
-            "required_submissions": t.required_submissions,
-        }
-        for t in tasks
-    ]
-
-
-@app.get("/tasks/{task_id}")
-def get_task(task_id: str, session: Session = Depends(get_session)):
-    task = session.get(Task, task_id)
-    if not task:
-        raise HTTPException(404, "Task not found")
-    subs = session.exec(select(Submission).where(
-        Submission.task_id == task_id)).all()
-    return {
-        "id": task.id,
-        "text": task.text,
-        "status": task.status,
-        "final_label": task.final_label,
-        "required_submissions": task.required_submissions,
-        "submissions": [
-            {"worker_id": s.worker_id, "label": s.label, "confidence": s.confidence}
-            for s in subs
-        ],
-    }
-
-# -----------------------
-# Workers
-# -----------------------
-
-
+# ---------- Workers ----------
 @app.post("/workers/register")
-def register_worker(_: WorkerRegister):
-    # Placeholder for future identity/auth; returns OK so workers can proceed
+def register_worker(body: RegisterBody):
+    now = now_utc()
+    with get_session() as s:
+        w = s.get(Worker, body.worker_id)
+        if not w:
+            w = Worker(worker_id=body.worker_id, status="active",
+                       last_seen=now, capabilities_json=body.capabilities_json)
+            s.add(w)
+        else:
+            w.status = "active"
+            w.last_seen = now
+            if body.capabilities_json:
+                w.capabilities_json = body.capabilities_json
+        s.commit()
     return {"ok": True}
 
 
+@app.post("/workers/heartbeat")
+def heartbeat(body: HeartbeatBody):
+    now = now_utc()
+    with get_session() as s:
+        w = s.get(Worker, body.worker_id)
+        if not w:
+            # auto-register on first heartbeat
+            w = Worker(worker_id=body.worker_id,
+                       status="active", last_seen=now)
+            s.add(w)
+        else:
+            w.status = "active"
+            w.last_seen = now
+            # ⬇️ NEW: extend leases for any tasks reserved by this worker
+        lease_until = now + timedelta(seconds=LEASE_SECONDS)
+        from sqlmodel import select
+        held = s.exec(
+            select(Task).where((Task.status == "assigned")
+                               & (Task.reserved_by == body.worker_id))
+        ).all()
+        for t in held:
+            t.lease_expires_at = lease_until
+        s.commit()
+    return {"ok": True, "ts": now.isoformat()}
+
+
+def _mark_stale_workers():
+    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TTL_SECONDS)
+    with get_session() as s:
+        stmt = select(Worker).where((Worker.last_seen.is_not(None)) & (
+            Worker.last_seen < cutoff) & (Worker.status != "stale"))
+        for w in s.exec(stmt).all():
+            w.status = "stale"
+        s.commit()
+
+
+# ---------- Tasks ----------
+@app.post("/tasks")
+def create_task(body: CreateTaskBody):
+    from uuid import uuid4
+    now = now_utc()
+    t = Task(
+        id=str(uuid4()),
+        text=body.text,
+        status="queued",
+        final_label=None,
+        required_submissions=body.required_submissions or 3,
+        created_at=now,
+        reserved_by=None,
+        lease_expires_at=None,
+        attempts=0,
+        max_attempts=body.max_attempts or MAX_ATTEMPTS_DEFAULT,
+        error_message=None,
+    )
+    with get_session() as s:
+        s.add(t)
+        s.commit()
+        s.refresh(t)  # ensures attributes are loaded and not expired
+    return {"task_id": t.id}
+
+
+@app.get("/tasks")
+def list_tasks(status: Optional[str] = None):
+    with get_session() as s:
+        if status:
+            stmt = select(Task).where(Task.status == status)
+        else:
+            stmt = select(Task)
+        rows = s.exec(stmt).all()
+        return [
+            {
+                "id": r.id,
+                "text": r.text,
+                "status": r.status,
+                "final_label": r.final_label,
+                "required_submissions": r.required_submissions,
+                "attempts": r.attempts,
+                "max_attempts": r.max_attempts,
+                "reserved_by": r.reserved_by,
+                "lease_expires_at": r.lease_expires_at.isoformat() if r.lease_expires_at else None,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+@app.get("/tasks/{task_id}")
+def get_task(task_id: str):
+    with get_session() as s:
+        t = s.get(Task, task_id)
+        if not t:
+            raise HTTPException(404, "Task not found")
+        subs = s.exec(select(Submission).where(Submission.task_id ==
+                      task_id).order_by(Submission.created_at)).all()
+        return {
+            "task": {
+                "id": t.id,
+                "text": t.text,
+                "status": t.status,
+                "final_label": t.final_label,
+                "required_submissions": t.required_submissions,
+                "attempts": t.attempts,
+                "max_attempts": t.max_attempts,
+                "reserved_by": t.reserved_by,
+                "lease_expires_at": t.lease_expires_at.isoformat() if t.lease_expires_at else None,
+                "created_at": t.created_at.isoformat(),
+            },
+            "submissions": [
+                {
+                    "worker_id": s_.worker_id,
+                    "label": s_.label,
+                    "confidence": s_.confidence,
+                    "created_at": s_.created_at.isoformat(),
+                }
+                for s_ in subs
+            ],
+        }
+
+
 @app.post("/tasks/next")
-def next_task(body: WorkerRequest, session: Session = Depends(get_session)):
-    """
-    Returns the next available task that:
-      - is not finalized
-      - still needs submissions (< required_submissions)
-      - hasn't already been assigned to this worker (per ASSIGNMENTS helper)
-    """
-    tasks = session.exec(select(Task).where(Task.status != "finalized")).all()
-    for t in tasks:
-        assigned = ASSIGNMENTS.setdefault(t.id, [])
-        # how many submissions already exist for this task?
-        subs_count = len(session.exec(
-            select(Submission).where(Submission.task_id == t.id)).all())
-        if subs_count >= t.required_submissions:
-            continue
-        if body.worker_id in assigned:
-            continue
+def next_task(body: NextTaskBody):
+    now = now_utc()
+    lease_until = now + timedelta(seconds=LEASE_SECONDS)
+    with get_session() as s:
+        # Prefer queued tasks; ignore finalized/failed
+        stmt = select(Task).where(Task.status.in_(("queued", "assigned"))).order_by(
+            Task.created_at.asc(), Task.id.asc())
+        tasks = s.exec(stmt).all()
 
-        # assign to this worker
-        assigned.append(body.worker_id)
+        # Filter out finalized and failed, and those that already met required_submissions
+        eligible: List[Task] = []
+        for t in tasks:
+            if t.status == "finalized" or t.status == "failed":
+                continue
+            # Keep if queued, or assigned but lease expired
+            if t.status == "queued":
+                eligible.append(t)
+            elif t.status == "assigned" and (t.lease_expires_at is None or t.lease_expires_at <= now):
+                eligible.append(t)
 
-        if t.status == "queued":
+        # Skip ones this worker already handled in this process memory
+        for t in eligible:
+            if ASSIGNMENTS.get(t.id) and body.worker_id in ASSIGNMENTS[t.id]:
+                continue
+
+            # Claim this one atomically
             t.status = "assigned"
-            session.add(t)
-            session.commit()
+            t.reserved_by = body.worker_id
+            t.lease_expires_at = lease_until
+            t.attempts = (t.attempts or 0) + 1
+            s.add(t)
+            # update memory helper
+            ASSIGNMENTS.setdefault(t.id, []).append(body.worker_id)
+            s.commit()
+            return {"task_id": t.id, "text": t.text}
 
-        return {"task_id": t.id, "text": t.text}
-
-    return {"task_id": None, "text": None}  # no work right now
+    return {"task_id": None, "text": None}
 
 
 @app.post("/workers/submit")
-def submit_result(body: WorkerSubmit, session: Session = Depends(get_session)):
-    task = session.get(Task, body.task_id)
-    if not task:
-        raise HTTPException(404, "Task not found")
+def submit_result(body: SubmitBody):
+    now = now_utc()
+    with get_session() as s:
+        t = s.get(Task, body.task_id)
+        if not t:
+            raise HTTPException(404, "Task not found")
 
-    # Deduplicate: only one submission per (worker, task)
-    existing = session.exec(
-        select(Submission).where(
-            (Submission.task_id == body.task_id) & (
-                Submission.worker_id == body.worker_id)
-        )
-    ).first()
-    if not existing:
-        session.add(
-            Submission(
-                task_id=body.task_id,
-                worker_id=body.worker_id,
-                label=body.label,
-                confidence=body.confidence,
+        # Dedup submission (one per worker per task)
+        existing = s.exec(
+            select(Submission).where(
+                (Submission.task_id == body.task_id) & (
+                    Submission.worker_id == body.worker_id)
             )
-        )
-        session.commit()
+        ).first()
+        if existing:
+            return {"ok": True, "duplicate": True}
 
-    # Check if we can finalize
-    subs = session.exec(select(Submission).where(
-        Submission.task_id == body.task_id)).all()
-    if task.final_label is None and len(subs) >= task.required_submissions:
-        # Majority vote
-        counts: Dict[str, int] = defaultdict(int)
-        for s in subs:
-            counts[s.label] += 1
+        s.add(Submission(
+            task_id=body.task_id,
+            worker_id=body.worker_id,
+            label=body.label,
+            confidence=body.confidence,
+            created_at=now,
+        ))
 
-        max_votes = max(counts.values())
-        majority_labels = [lbl for lbl, c in counts.items() if c == max_votes]
+        # Evaluate for finalization
+        subs = s.exec(select(Submission).where(
+            Submission.task_id == body.task_id)).all()
+        if len(subs) >= (t.required_submissions or 3) and not t.final_label:
+            # Majority vote with confidence tiebreak
+            by_label: Dict[str, List[Submission]] = {}
+            for sub in subs:
+                by_label.setdefault(sub.label, []).append(sub)
+            # majority
+            best_label = None
+            best_count = -1
+            for label, arr in by_label.items():
+                if len(arr) > best_count:
+                    best_count = len(arr)
+                    best_label = label
+                elif len(arr) == best_count:
+                    # tie -> avg confidence
+                    def avg(l): return sum(x.confidence for x in l) / len(l)
+                    if avg(arr) > avg(by_label[best_label]):
+                        best_label = label
 
-        if len(majority_labels) == 1:
-            final = majority_labels[0]
-        else:
-            # tie-break: highest average confidence
-            best_lbl, best_conf = None, -1.0
-            for lbl in majority_labels:
-                confs = [s.confidence for s in subs if s.label == lbl]
-                avg = sum(confs) / len(confs)
-                if avg > best_conf:
-                    best_lbl, best_conf = lbl, avg
-            final = best_lbl
+            t.final_label = best_label
+            t.status = "finalized"
+            t.reserved_by = None
+            t.lease_expires_at = None
 
-        # Persist finalization
-        task.final_label = final
-        task.status = "finalized"
-        session.add(task)
+            # Award points
+            winners = [sub.worker_id for sub in subs if sub.label == best_label]
+            for wid in set(winners):
+                ws = s.get(WorkerScore, wid)
+                if not ws:
+                    ws = WorkerScore(worker_id=wid, points=1)
+                    s.add(ws)
+                else:
+                    ws.points += 1
 
-        # Award points to matching workers
-        winners = {s.worker_id for s in subs if s.label == final}
-        for wid in winners:
-            row = session.get(WorkerScore, wid)
-            if not row:
-                row = WorkerScore(worker_id=wid, points=0)
-            row.points += 1
-            session.add(row)
-
-        session.commit()
-
-    return {"ok": True, "finalized": task.final_label is not None}
-
-# -----------------------
-# Leaderboard
-# -----------------------
+        s.commit()
+    return {"ok": True}
 
 
+# ---------- Requeue / Maintenance ----------
+@app.post("/ops/requeue-stale")
+def manual_requeue():
+    count = _requeue_expired()
+    return {"requeued": count}
+
+
+def _requeue_expired() -> int:
+    now = now_utc()
+    cutoff_worker = now - timedelta(seconds=HEARTBEAT_TTL_SECONDS)
+    count = 0
+    with get_session() as s:
+        stmt = select(Task).where(Task.status == "assigned")
+        for t in s.exec(stmt).all():
+            lease_expired = (t.lease_expires_at and t.lease_expires_at <= now)
+            worker_stale = False
+            if t.reserved_by:
+                w = s.get(Worker, t.reserved_by)
+                # Only treat as stale if the worker EXISTS and is past cutoff or marked stale.
+                if w and ((not w.last_seen) or (w.last_seen < cutoff_worker) or (w.status == "stale")):
+                    worker_stale = True
+
+            if lease_expired or worker_stale:
+                if (t.attempts or 0) >= (t.max_attempts or MAX_ATTEMPTS_DEFAULT):
+                    t.status = "failed"
+                    t.error_message = (
+                        t.error_message or "max attempts reached")
+                    t.reserved_by = None
+                    t.lease_expires_at = None
+                else:
+                    t.status = "queued"
+                    t.reserved_by = None
+                    t.lease_expires_at = None
+                s.add(t)
+                count += 1
+        s.commit()
+    return count
+
+
+# ---------- Stats / Leaderboard ----------
 @app.get("/leaderboard")
-def leaderboard(session: Session = Depends(get_session)):
-    rows = session.exec(select(WorkerScore)).all()
-    rows.sort(key=lambda r: r.points, reverse=True)
-    return [{"worker_id": r.worker_id, "points": r.points} for r in rows]
+def leaderboard():
+    with get_session() as s:
+        rows = s.exec(select(WorkerScore).order_by(
+            WorkerScore.points.desc())).all()
+        return [{"worker_id": r.worker_id, "points": r.points} for r in rows]
 
 
 @app.get("/db/stats")
-def db_stats(session: Session = Depends(get_session)):
-    tasks = session.exec(select(func.count(Task.id))).one()
-    subs = session.exec(select(func.count(Submission.id))).one()
-    wrks = session.exec(select(func.count(WorkerScore.worker_id))).one()
-    return {"tasks": tasks, "submissions": subs, "workers": wrks}
+def db_stats():
+    with get_session() as s:
+        total_tasks = s.exec(select(Task)).all()
+        submissions = s.exec(select(Submission)).all()
+        workers = s.exec(select(Worker)).all()
+        by_status = {"queued": 0, "assigned": 0, "finalized": 0, "failed": 0}
+        for t in total_tasks:
+            by_status[t.status] = by_status.get(t.status, 0) + 1
+        # stale workers
+        cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TTL_SECONDS)
+        stale = [w for w in workers if (w.last_seen and w.last_seen < cutoff)]
+        return {
+            "tasks_total": len(total_tasks),
+            "tasks_by_status": by_status,
+            "submissions": len(submissions),
+            "workers": len(workers),
+            "workers_stale": len(stale),
+        }
+
+# ---------- Reset endpoint (clear tables) ----------
+
+
+@app.post("/ops/reset")
+def reset_db():
+    with get_session() as s:
+        s.exec("DELETE FROM submission")
+        s.exec("DELETE FROM task")
+        s.exec("DELETE FROM workerscore")
+        s.exec("DELETE FROM worker")
+        s.commit()
+    return {"ok": True, "msg": "All tables cleared."}

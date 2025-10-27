@@ -3,7 +3,7 @@
 - Không hi vọng nhiều nhưng cũng phải cố gắng hết mình trước đã
 
 A lightweight experimental framework for coordinating and verifying distributed AI inference jobs across multiple worker nodes.  
-Built with **FastAPI**, **SQLModel**, and **Hugging Face Transformers** — inspired by decentralized AI compute networks like Tensora and Bittensor.
+Built with **FastAPI**, **SQLModel**, and **Hugging Face Transformers** — inspired by decentralized AI compute networks like Bittensor.
 
 ---
 

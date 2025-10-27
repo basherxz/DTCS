@@ -58,6 +58,31 @@ def submit(task_id, label, conf):
     return r.json()
 
 
+def register_and_heartbeat(base_url: str, worker_id: str):
+    import threading
+    import time
+    import requests
+
+    def hb():
+        while True:
+            try:
+                requests.post(f"{base_url}/workers/heartbeat",
+                              json={"worker_id": worker_id}, timeout=5)
+            except Exception:
+                pass
+            time.sleep(30)
+
+    # register once
+    try:
+        requests.post(f"{base_url}/workers/register",
+                      json={"worker_id": worker_id}, timeout=5)
+    except Exception:
+        pass
+
+    t = threading.Thread(target=hb, daemon=True)
+    t.start()
+
+
 def main():
     print(f"[{WORKER_ID}] starting...")
     while True:
