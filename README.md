@@ -49,22 +49,22 @@ If a worker vanishes, the coordinator notices and reassigns the task, ensuring t
 This project follows a few core ideas that guide every decision:
 
 - **Reliability Through Simplicity**
-Complexity hides failure. By keeping logic explicit and state visible, reliability becomes inspectable and testable.
+  - Complexity hides failure. By keeping logic explicit and state visible, reliability becomes inspectable and testable.
 
 - **Assume Failure, Design for Recovery**
-Every part of the system — worker, lease, or task — is treated as unreliable.
-The system’s job is not to prevent failure, but to recover gracefully from it.
+  - Every part of the system — worker, lease, or task — is treated as unreliable.
+  - The system’s job is not to prevent failure, but to recover gracefully from it.
 
 - **State Is Truth**
-The database is the brain. Everything else — workers, API servers — can crash, restart, or vanish.
-As long as state persists, the system can rebuild itself.
+  - The database is the brain. Everything else — workers, API servers — can crash, restart, or vanish.
+  - As long as state persists, the system can rebuild itself.
 
 - **Clarity Over Cleverness**
-Code should explain itself. If you need a diagram to understand the flow, the code has failed in its duty.
+  - Code should explain itself. If you need a diagram to understand the flow, the code has failed in its duty.
 
 - **Progress Over Perfection**
-A system that moves — even imperfectly — is better than one that waits for ideal design.
-Movement generates learning; learning generates resilience.
+  - A system that moves — even imperfectly — is better than one that waits for ideal design.
+  - Movement generates learning; learning generates resilience.
 
 These principles serve as both engineering rules and personal reminders — the system grows sturdier the same way its creator does: one iteration at a time.
 
@@ -118,3 +118,4 @@ curl -X POST localhost:8000/tasks -H "Content-Type: application/json" -d '{"data
 # License
 
 MIT — free to use, modify, and extend. Contributions welcome. Created by **Si Nguyen** (_Sint/Basherxz_), 2025.
+> Vì một tương lai không phải trả nợ
