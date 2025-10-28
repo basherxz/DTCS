@@ -2,7 +2,6 @@
 
 A lightweight, reliable framework for orchestrating distributed work across multiple workers.
 
-
 # About This Project
 
 What started as a small experiment in queue management quietly evolved into something bigger — **an attempt to teach code how to organize itself**.
@@ -25,6 +24,7 @@ It was built out of equal parts curiosity and stubbornness — a personal challe
 - **Stateless workers:** scale up or down seamlessly — no manual management required.
 
 # Architecture Overview
+
 ```
 flowchart LR
   subgraph Coordinator
@@ -49,17 +49,21 @@ If a worker vanishes, the coordinator notices and reassigns the task, ensuring t
 This project follows a few core ideas that guide every decision:
 
 - **Reliability Through Simplicity**
+
   - Complexity hides failure. By keeping logic explicit and state visible, reliability becomes inspectable and testable.
 
 - **Assume Failure, Design for Recovery**
+
   - Every part of the system — worker, lease, or task — is treated as unreliable.
   - The system’s job is not to prevent failure, but to recover gracefully from it.
 
 - **State Is Truth**
+
   - The database is the brain. Everything else — workers, API servers — can crash, restart, or vanish.
   - As long as state persists, the system can rebuild itself.
 
 - **Clarity Over Cleverness**
+
   - Code should explain itself. If you need a diagram to understand the flow, the code has failed in its duty.
 
 - **Progress Over Perfection**
@@ -70,20 +74,20 @@ These principles serve as both engineering rules and personal reminders — the 
 
 # Roadmap
 
- - [x] Core leasing and task assignment logic
+- [x] Core leasing and task assignment logic
 
- - [x] Heartbeats and reliability layer (auto-lease renewal)
+- [x] Heartbeats and reliability layer (auto-lease renewal)
 
- - [ ] Next: Metrics and dashboard for visibility
+- [x] Metrics and dashboard for visibility
 
- - [ ] Plugin task runners (custom task logic)
+- [ ] Next: Plugin task runners (custom task logic)
 
- - [ ] Coordinator clustering for horizontal scaling
+- [ ] Coordinator clustering for horizontal scaling
 
 # Project Goal
 
 > “To create a self-coordinating distributed task system that embodies reliability, autonomy, and scale —
-and to prove, through its existence, that complex systems can be built from first principles.”
+> and to prove, through its existence, that complex systems can be built from first principles.”
 
 This project is both a technical and philosophical exploration:
 Can a simple, human-written program behave like a self-managing organism?
@@ -103,8 +107,9 @@ That’s what’s waiting at the end of this road.
 
 - Docker (optional) for deployment
 
- # Getting Started
- ```bash
+# Getting Started
+
+```bash
 # Start the coordinator
 uvicorn coordinator:app --reload
 
@@ -118,4 +123,5 @@ curl -X POST localhost:8000/tasks -H "Content-Type: application/json" -d '{"data
 # License
 
 MIT — free to use, modify, and extend. Contributions welcome. Created by **Si Nguyen** (_Sint/Basherxz_), 2025.
+
 > Vì một tương lai không phải trả nợ
