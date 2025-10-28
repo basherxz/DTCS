@@ -8,7 +8,8 @@ from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTEN
 from fastapi.responses import Response
 import time
 from functools import wraps
-from sqlmodel import select
+from sqlmodel import select, delete
+from fastapi.responses import HTMLResponse
 
 from .db import init_db, get_session, now_utc
 from .models import Task, Submission, WorkerScore, Worker
@@ -457,12 +458,18 @@ def db_stats():
 @app.post("/ops/reset")
 def reset_db():
     with get_session() as s:
-        s.exec("DELETE FROM submission")
-        s.exec("DELETE FROM task")
-        s.exec("DELETE FROM workerscore")
-        s.exec("DELETE FROM worker")
+        # delete children first to satisfy FK constraints
+        s.exec(delete(Submission))
+        s.exec(delete(Task))
+        s.exec(delete(WorkerScore))
+        s.exec(delete(Worker))
         s.commit()
+    # (optional) refresh metrics after reset
+    _update_queue_gauges()
+    _update_worker_gauge()
     return {"ok": True, "msg": "All tables cleared."}
+
+# --------- Prometheus Metrics Endpoint ----------
 
 
 @app.get("/metrics")
@@ -472,12 +479,16 @@ def metrics():
     _update_worker_gauge()
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
+# ---------- Metrics Updaters ----------
+
 
 def _update_queue_gauges():
     with get_session() as s:
         for st in ("queued", "assigned", "finalized", "failed"):
             cnt = s.exec(select(Task).where(Task.status == st)).all()
             QUEUE_DEPTH.labels(st).set(len(cnt))
+
+# ---------- Worker Gauge Updater ----------
 
 
 def _update_worker_gauge():
@@ -488,3 +499,115 @@ def _update_worker_gauge():
         active = sum(1 for w in workers if w.last_seen and w.last_seen >=
                      cutoff and w.status == "active")
         WORKERS_GAUGE.set(active)
+
+# ---------- Dashboard Endpoints ----------
+
+
+@app.get("/dashboard/summary")
+def dashboard_summary():
+    # reuse logic from /db/stats, but add recent activity timestamps if you want
+    return db_stats()
+
+# ---------- Recent Tasks / Workers ----------
+
+
+@app.get("/dashboard/tasks")
+def dashboard_tasks():
+    # return last N (e.g., 100) tasks sorted by created_at desc
+    with get_session() as s:
+        rows = s.exec(select(Task).order_by(
+            Task.created_at.desc()).limit(100)).all()
+        return [{
+            "id": r.id, "text": r.text, "type": r.type,
+            "status": r.status, "reserved_by": r.reserved_by,
+            "lease_expires_at": r.lease_expires_at.isoformat() if r.lease_expires_at else None,
+            "attempts": r.attempts, "created_at": r.created_at.isoformat()
+        } for r in rows]
+
+# ---------- Recent Workers ----------
+
+
+@app.get("/dashboard/workers")
+def dashboard_workers():
+    with get_session() as s:
+        rows = s.exec(select(Worker).order_by(Worker.created_at.desc())).all()
+        return [{
+            "worker_id": w.worker_id, "status": w.status,
+            "last_seen": w.last_seen.isoformat() if w.last_seen else None
+        } for w in rows]
+
+
+# ---------- Simple HTML Dashboard ----------
+DASHBOARD_HTML = """
+<!doctype html><html>
+<head>
+  <meta charset="utf-8"/><title>Coordinator Dashboard</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>body{font-family:system-ui;margin:20px} .grid{display:grid;gap:12px;grid-template-columns:repeat(4,1fr)}
+  table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:6px} th{background:#f7f7f7}</style>
+</head>
+<body>
+  <h1>AI Market — Dashboard</h1>
+
+  <div class="grid" hx-get="/dashboard/summary" hx-trigger="load, every 5s" hx-swap="innerHTML">
+    <!-- filled by JSON to HTML via /dashboard/summary below -->
+  </div>
+
+  <h2>Workers</h2>
+  <div id="workers" hx-get="/dashboard/workers_html" hx-trigger="load, every 5s"></div>
+
+  <h2>Recent Tasks</h2>
+  <div id="tasks" hx-get="/dashboard/tasks_html" hx-trigger="load, every 5s"></div>
+
+  <form action="/ops/requeue-stale" method="post"><button>Requeue stale</button></form>
+  <form action="/ops/reset" method="post" style="margin-top:8px"><button>Reset (dev)</button></form>
+</body></html>
+"""
+# ---------- Dashboard HTML Endpoints ----------
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard_page():
+    return DASHBOARD_HTML
+
+# ---------- Summary HTML ----------
+
+
+def _summary_html():
+    data = db_stats()
+    t = data["tasks_by_status"]
+    return f"""
+      <div><b>Queued</b><br/>{t.get('queued',0)}</div>
+      <div><b>Assigned</b><br/>{t.get('assigned',0)}</div>
+      <div><b>Finalized</b><br/>{t.get('finalized',0)}</div>
+      <div><b>Failed</b><br/>{t.get('failed',0)}</div>
+    """
+# ---------- Summary HTML Endpoint ----------
+
+
+@app.get("/dashboard/summary", response_class=HTMLResponse)
+def dashboard_summary_html():
+    return _summary_html()
+
+# ---------- Workers HTML Endpoint ----------
+
+
+@app.get("/dashboard/workers_html", response_class=HTMLResponse)
+def workers_html():
+    rows = dashboard_workers()
+    trs = "".join(
+        f"<tr><td>{w['worker_id']}</td><td>{w['status']}</td><td>{w['last_seen'] or '-'}</td></tr>" for w in rows)
+    return f"<table><tr><th>Worker</th><th>Status</th><th>Last seen</th></tr>{trs}</table>"
+
+# ---------- Tasks HTML Endpoint ----------
+
+
+@app.get("/dashboard/tasks_html", response_class=HTMLResponse)
+def tasks_html():
+    rows = dashboard_tasks()
+    trs = "".join(
+        f"<tr><td>{r['id']}</td><td>{r.get('type') or '-'}</td><td>{r['status']}</td>"
+        f"<td>{r.get('reserved_by') or '-'}</td><td>{r.get('lease_expires_at') or '-'}</td>"
+        f"<td>{r['attempts']}</td><td>{r['created_at']}</td></tr>"
+        for r in rows)
+    return "<table><tr><th>ID</th><th>Type</th><th>Status</th><th>Reserved by</th><th>Lease until</th><th>Attempts</th><th>Created</th></tr>"+trs+"</table>"
